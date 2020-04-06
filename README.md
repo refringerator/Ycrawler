@@ -24,4 +24,7 @@ optional arguments:
   --limit LIMIT    Number of new stories to download
   --verbose        Detailed output
   --path PATH      Folder to collect stories
+  --connections_limit CONNECTIONS_LIMIT
+                        The limit for simultaneous connections
+
   ```

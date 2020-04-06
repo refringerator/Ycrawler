@@ -7,7 +7,6 @@ import async_timeout
 import html
 import re
 from datetime import datetime
-from functools import partial
 
 LOGGER_FORMAT = '%(asctime)s %(message)s'
 URL_TEMPLATE = "https://hacker-news.firebaseio.com/v0/item/{}.json"
@@ -17,6 +16,7 @@ FETCH_TIMEOUT = 10
 CHUNK_SIZE = 1024
 REG_EXP = r'<a[^>]* href="([^"]*)"'
 DOWNLOADED_STORIES = []
+CONTENT_FILE = 'list.txt'
 
 parser = argparse.ArgumentParser(
     description='Download top stories from news.ycombinator.com \
@@ -25,6 +25,7 @@ parser.add_argument('--period', type=int, default=30, help='Number of seconds be
 parser.add_argument('--limit', type=int, default=30, help='Number of new stories to download')
 parser.add_argument('--verbose', action='store_true', help='Detailed output')
 parser.add_argument('--path', type=str, default='./stories', help='Folder to collect stories')
+parser.add_argument('--connections_limit', type=int, default=3, help='The limit for simultaneous connections')
 
 logging.basicConfig(format=LOGGER_FORMAT, datefmt='[%H:%M:%S]')
 log = logging.getLogger()
@@ -44,26 +45,32 @@ class URLFetcher:
         """
         with async_timeout.timeout(FETCH_TIMEOUT):
             self.fetch_counter += 1
+            try:
+                async with session.get(url) as response:
+                    if just_json:
+                        log.debug('Response status {} on {}'.format(response.status, url))
+                        return await response.json()
+                    else:
+                        write_to_disk(await response.read(), url, dest_dir)
 
-            async with session.get(url) as response:
-                if just_json:
-                    return await response.json()
-                else:
-                    basename = os.path.basename(url)
-                    full_filename = os.path.join(dest_dir,
-                                                 basename if basename else url.replace('/', '-').replace('.', '_'))
-                    with open(full_filename, 'wb') as f_handle:
-                        while True:
-                            chunk = await response.content.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            f_handle.write(chunk)
-                    return await response.release()
+            except asyncio.TimeoutError:
+                log.error('Timeout error on url: {}'.format(url))
+
+
+def write_to_disk(resp_bytes, url, dest_dir):
+    if resp_bytes is None:
+        log.debug('Nothing to save: {}'.format(url))
+        return
+    basename = os.path.basename(url)
+    filename = basename if basename else url.replace('/', '-').replace('.', '_')
+    full_filename = os.path.join(dest_dir, filename[:30])
+    with open(full_filename, 'wb') as f:
+        f.write(resp_bytes)
 
 
 def get_dir_name_for_story(dest_dir, title, story_id, url):
     basename = os.path.basename(url)
-    dir_name = ''.join([str(story_id), ' ', basename if basename else title[:25]])
+    dir_name = ''.join([str(story_id), ' ', str(basename if basename else title)[:25]])
     path = os.path.join(dest_dir, dir_name)
     if not os.path.exists(path):
         create_dir_and_add_to_list(dest_dir, path, title, story_id, url)
@@ -74,7 +81,7 @@ def get_dir_name_for_story(dest_dir, title, story_id, url):
 def create_dir_and_add_to_list(dest_dir, path, title, story_id, url):
     os.makedirs(path)
     DOWNLOADED_STORIES.append(story_id)
-    with open(os.path.join(dest_dir, 'list.txt'), 'at') as f:
+    with open(os.path.join(dest_dir, CONTENT_FILE), 'at') as f:
         f.write('\t'.join([str(story_id), title, url]) + '\n')
 
 
@@ -83,8 +90,12 @@ def find_refs_in_comment(comment):
 
 
 def init_list(story_dir):
-    with open(os.path.join(story_dir, 'list.txt'), 'r') as f:
-        return [int(item.split('\t')[0]) for item in f.readlines()]
+    path_to_file = os.path.join(story_dir, CONTENT_FILE)
+    if os.path.exists(path_to_file):
+        with open(path_to_file, 'r') as f:
+            return [int(item.split('\t')[0]) for item in f.readlines()]
+    else:
+        return []
 
 
 def unpack_result(results, index):
@@ -140,51 +151,54 @@ async def post_download_page_with_refs_in_comments(loop, session, fetcher, post_
     return number_of_comments, number_of_refs
 
 
-async def download_top_stories_with_refs_in_comment(loop, limit, iteration, path):
+async def download_top_stories_with_refs_in_comment(loop, limit, iteration, path, connections_limit):
     """Retrieve top stories in HN.
     """
-    async with aiohttp.ClientSession(loop=loop) as session:
+    connector = aiohttp.TCPConnector(limit_per_host=connections_limit, loop=loop)
+    async with aiohttp.ClientSession(connector=connector) as session:
         fetcher = URLFetcher()  # create a new fetcher for this task
         response = await fetcher.fetch(session, TOP_STORIES_URL)
         tasks = [post_download_page_with_refs_in_comments(
-            loop, session, fetcher, post_id, path) for post_id in response[:limit]if post_id not in DOWNLOADED_STORIES]
-        results = await asyncio.gather(*tasks)
-        for post_id, num_comments, num_refs in \
-                zip(response[:limit], unpack_result(results, 0), unpack_result(results, 1)):
-            log.info("Post {} has {} comments and {} refs in comments ({})".format(
-                post_id, num_comments, num_refs, iteration))
-        return fetcher.fetch_counter  # return the fetch count
+            loop, session, fetcher, post_id, path) for post_id in response[:limit] if post_id not in DOWNLOADED_STORIES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for post_id, result in zip(response[:limit], results):
+            if isinstance(result, Exception):
+                log.error("Unexpected exception with post {}: ".format(post_id, result))
+            else:
+                log.info("Post {} has {} comments and {} refs in comments ({})".format(
+                    post_id, *result, iteration))
+
+        return fetcher.fetch_counter
 
 
-def poll_top_stories(loop, period, limit, path, iteration=0):
+async def poll_top_stories(loop, period, limit, path, connections_limit):
     """Periodic function that schedules download_top_stories_with_refs_in_comment.
     """
-    log.info("Downloading web pages for top {} stories ({})".format(
-        limit, iteration))
+    iteration = 0
+    while True:
+        iteration += 1
 
-    future = asyncio.ensure_future(
-        download_top_stories_with_refs_in_comment(loop, limit, iteration, path))
+        log.info("Downloading web pages for top {} stories ({})".format(
+            limit, iteration))
 
-    now = datetime.now()
+        now = datetime.now()
 
-    def callback(fut):
-        fetch_count = fut.result()
-        log.info(
-            '> Downloading stories with pages referenced in comments took {:.2f} seconds and {} fetches'.format(
-                (datetime.now() - now).total_seconds(), fetch_count))
+        try:
+            fetch_count = await download_top_stories_with_refs_in_comment\
+                (loop, limit, iteration, path, connections_limit)
 
-    future.add_done_callback(callback)
+            log.info(
+                '> Downloading stories with pages referenced in comments took {:.2f} seconds and {} fetches'.format(
+                    (datetime.now() - now).total_seconds(), fetch_count))
 
-    log.info("Waiting for {} seconds...".format(period))
+        except Exception as e:
+            log.error("Unexpected exception in poll_top_stories: {}".format(e))
 
-    iteration += 1
-    loop.call_later(
-        period,
-        partial(  # or call_at(loop.time() + period)
-            poll_top_stories,
-            loop, period, limit, path, iteration
-        )
-    )
+        log.info("Waiting for {} seconds...".format(period))
+
+        iteration += 1
+        await asyncio.sleep(period)
 
 
 if __name__ == '__main__':
@@ -196,6 +210,13 @@ if __name__ == '__main__':
     log.info("Already downloaded stories: {}".format(DOWNLOADED_STORIES))
 
     loop = asyncio.get_event_loop()
-    poll_top_stories(loop, args.period, args.limit, args.path)
-    loop.run_forever()
-    loop.close()
+    try:
+        loop.run_until_complete(poll_top_stories(loop, args.period, args.limit, args.path, args.connections_limit))
+    except KeyboardInterrupt:
+        log.info("Keyboard Interrupt")
+
+    except Exception as e:
+        log.error("Unexpected exception: {}".format(e))
+
+    finally:
+        loop.close()
